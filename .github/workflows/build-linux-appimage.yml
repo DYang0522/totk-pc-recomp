@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       install_dir:
-        description: "Absolute path to the existing Linux TotK install folder (must contain totk-install.json and .setup-temp/gen)"
+        description: "Absolute path to the existing Linux TotK install folder (must contain totk-install.json and exefs)"
         required: true
         type: string
 
@@ -13,8 +13,8 @@ permissions:
 
 jobs:
   build-appimage:
-    # This must run on the Linux machine that already has the user's 0.4.0 install cache.
-    # Do not change this to ubuntu-latest: GitHub-hosted runners cannot access local game-derived build data.
+    # This must run on the Linux machine that already has the user's 0.4.0 install.
+    # GitHub-hosted runners cannot access local game-derived build data without uploading it.
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 180
 
@@ -34,7 +34,7 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
-      - name: Validate existing installation cache
+      - name: Validate existing installation
         id: cache
         env:
           INSTALL_DIR: ${{ inputs.install_dir }}
@@ -51,18 +51,19 @@ jobs:
               raise SystemExit("install_dir must be an absolute path")
           install = install.resolve()
           state_path = install / "totk-install.json"
-          temp = install / ".setup-temp"
-          gen = temp / "gen"
-          build = temp / "build"
+          gen = install / ".setup-temp" / "gen"
+          build = install / ".setup-temp" / "build"
+          has_gen = (gen / "layout.json").is_file()
+          has_exefs = (install / "exefs" / "main.nso").is_file()
 
           if not install.is_dir():
               raise SystemExit(f"Install folder does not exist: {install}")
           if not state_path.is_file():
               raise SystemExit(f"Missing {state_path}; this does not look like an install made by the 0.4.0 installer.")
-          if not (gen / "layout.json").is_file():
+          if not has_gen and not has_exefs:
               raise SystemExit(
-                  f"Missing {gen / 'layout.json'}. The old install's generated-code cache was not retained; "
-                  "the AppImage cannot be built from this cache."
+                  "Neither .setup-temp/gen/layout.json nor exefs/main.nso exists. "
+                  "The installer cache and extracted game modules are both missing."
               )
 
           state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -70,35 +71,17 @@ jobs:
           tags = {"1.2.1": "v121", "1.4.3": "v143"}
           if version not in tags:
               raise SystemExit(
-                  f"This AppImage builder needs a v121 or v143 cache; install records game version {version!r}."
+                  f"This AppImage builder needs a v121 or v143 install; recorded game version is {version!r}."
               )
 
           print(f"version={tags[version]}")
           print(f"install_dir={install}")
-          print(f"gen_dir={gen.resolve()}")
+          print(f"gen_dir={gen.resolve() if has_gen else ''}")
+          print(f"reuse_gen={'yes' if has_gen else 'no'}")
           print(f"build_cache={'yes' if build.is_dir() else 'no'}")
           print(f"shader_cache={'yes' if (install / 'shader-cache').is_dir() else 'no'}")
-          print(f"Using existing game version {version}; no game dump or prod.keys are uploaded.")
+          print(f"Using installed game version {version}; no game dump or prod.keys are uploaded.")
           PY
-
-      - name: Reuse the installed generated-code metadata
-        env:
-          INSTALL_DIR: ${{ inputs.install_dir }}
-          GAME_TAG: ${{ steps.cache.outputs.version }}
-          BUILD_CACHE: ${{ steps.cache.outputs.build_cache }}
-          SHADER_CACHE: ${{ steps.cache.outputs.shader_cache }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p generated
-          target="generated/$GAME_TAG"
-          if [ -e "$target" ] || [ -L "$target" ]; then
-            rm -rf "$target"
-          fi
-          ln -s "$(realpath "$INSTALL_DIR/.setup-temp/gen")" "$target"
-          test -f "$target/layout.json"
-          echo "Linked $target to the existing local install cache."
-          echo "Existing compile cache: $BUILD_CACHE; existing shader cache: $SHADER_CACHE."
 
       - name: Check host build tools
         shell: bash
@@ -118,6 +101,32 @@ jobs:
           python -m pip install --upgrade pip uv
           uv venv --python "$(command -v python)" .venv
           uv pip install --python .venv/bin/python -r tools/requirements.txt
+
+      - name: Reuse or regenerate the runtime layout metadata
+        env:
+          INSTALL_DIR: ${{ inputs.install_dir }}
+          GAME_TAG: ${{ steps.cache.outputs.version }}
+          REUSE_GEN: ${{ steps.cache.outputs.reuse_gen }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p generated
+          target="generated/$GAME_TAG"
+          if [ -e "$target" ] || [ -L "$target" ]; then
+            rm -rf "$target"
+          fi
+
+          if [ "$REUSE_GEN" = "yes" ]; then
+            ln -s "$(realpath "$INSTALL_DIR/.setup-temp/gen")" "$target"
+            echo "Reusing generated metadata from the existing 0.4.0 installation."
+          else
+            .venv/bin/python recomp/gen.py \
+              --exefs "$INSTALL_DIR/exefs" \
+              --out "$target" \
+              --patches "recomp/patches-$GAME_TAG.txt"
+            echo "Regenerated code metadata from the already-extracted ExeFS; no NSP/XCI extraction."
+          fi
+          test -f "$target/layout.json"
 
       - name: Build Linux setup AppImage
         shell: bash
