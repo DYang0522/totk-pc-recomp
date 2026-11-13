@@ -57,7 +57,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            build-essential binutils pkg-config make tar xz-utils git curl zlib1g-dev xvfb xauth fonts-dejavu-core
+            build-essential binutils pkg-config make tar xz-utils git curl zlib1g-dev xvfb xauth fonts-dejavu-core mesa-vulkan-drivers vulkan-tools
 
       - name: Fetch pinned reference projects
         shell: bash
