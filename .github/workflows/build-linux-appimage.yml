@@ -150,6 +150,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # GitHub-hosted runners have no physical GPU; use Mesa lavapipe for the Vulkan self-test.
+          export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          export VK_DRIVER_FILES="$VK_ICD_FILENAMES"
+          test -s "$VK_ICD_FILENAMES"
+          vulkaninfo --summary
           xvfb-run -a .venv/bin/python tools/make_release_linux.py \
             --out build/release/TotK-Setup-linux \
             --appimage build/release/TotK-Setup-x86_64.AppImage
