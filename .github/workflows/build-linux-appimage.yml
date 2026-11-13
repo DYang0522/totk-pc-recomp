@@ -1,98 +1,77 @@
-name: Build Linux AppImage from existing local cache
+name: Build Linux AppImage (GitHub-hosted)
 
 on:
   workflow_dispatch:
     inputs:
-      install_dir:
-        description: "Absolute path to the existing Linux TotK install folder (must contain totk-install.json and exefs)"
+      source_ref:
+        description: "Branch or commit to build (must contain the ability_guard fix)"
         required: true
+        default: "dev"
         type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: linux-appimage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-appimage:
-    # This must run on the Linux machine that already has the user's 0.4.0 install.
-    # GitHub-hosted runners cannot access local game-derived build data without uploading it.
-    runs-on: [self-hosted, linux, x64]
-    timeout-minutes: 180
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
 
     steps:
-      - name: Check out the patched dev branch
+      - name: Check out source
         uses: actions/checkout@v4
         with:
-          ref: dev
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up Python and .NET
+      - name: Verify the ability_guard fix is included
+        shell: bash
+        run: |
+          set -euo pipefail
+          FIX=e6839387fcfdcb045c8a38054854cfabfd098f5d
+          git merge-base --is-ancestor "$FIX" HEAD || {
+            echo "::error::The selected source ref does not contain commit $FIX (ability_guard fix)."
+            exit 1
+          }
+          echo "Building $(git rev-parse HEAD)"
+          echo "Contains ability_guard fix $FIX"
+
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - uses: actions/setup-dotnet@v4
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
 
-      - name: Validate existing installation
-        id: cache
-        env:
-          INSTALL_DIR: ${{ inputs.install_dir }}
+      - name: Install Linux build prerequisites
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          import os
-          from pathlib import Path
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential binutils pkg-config make tar xz-utils git curl zlib1g-dev
 
-          install = Path(os.environ["INSTALL_DIR"]).expanduser()
-          if not install.is_absolute():
-              raise SystemExit("install_dir must be an absolute path")
-          install = install.resolve()
-          state_path = install / "totk-install.json"
-          gen = install / ".setup-temp" / "gen"
-          build = install / ".setup-temp" / "build"
-          has_gen = (gen / "layout.json").is_file()
-          has_exefs = (install / "exefs" / "main.nso").is_file()
-
-          if not install.is_dir():
-              raise SystemExit(f"Install folder does not exist: {install}")
-          if not state_path.is_file():
-              raise SystemExit(f"Missing {state_path}; this does not look like an install made by the 0.4.0 installer.")
-          if not has_gen and not has_exefs:
-              raise SystemExit(
-                  "Neither .setup-temp/gen/layout.json nor exefs/main.nso exists. "
-                  "The installer cache and extracted game modules are both missing."
-              )
-
-          state = json.loads(state_path.read_text(encoding="utf-8"))
-          version = state.get("version", "1.2.1")
-          tags = {"1.2.1": "v121", "1.4.3": "v143"}
-          if version not in tags:
-              raise SystemExit(
-                  f"This AppImage builder needs a v121 or v143 install; recorded game version is {version!r}."
-              )
-
-          print(f"version={tags[version]}")
-          print(f"install_dir={install}")
-          print(f"gen_dir={gen.resolve() if has_gen else ''}")
-          print(f"reuse_gen={'yes' if has_gen else 'no'}")
-          print(f"build_cache={'yes' if build.is_dir() else 'no'}")
-          print(f"shader_cache={'yes' if (install / 'shader-cache').is_dir() else 'no'}")
-          print(f"Using installed game version {version}; no game dump or prod.keys are uploaded.")
-          PY
-
-      - name: Check host build tools
+      - name: Fetch pinned reference projects
         shell: bash
         run: |
           set -euo pipefail
-          for tool in make pkg-config tar xz; do
-            if ! command -v "$tool" >/dev/null 2>&1; then
-              echo "::error::Missing '$tool'. Install the Linux release prerequisites from docs/installer.md."
-              exit 1
-            fi
-          done
+          bash tools/fetch_refs.sh
+
+      - name: Restore release download cache
+        uses: actions/cache@v4
+        with:
+          path: toolchain/release-dl
+          key: linux-release-downloads-v1-${{ hashFiles('tools/make_release_linux.py', 'tools/make_release.py') }}
+          restore-keys: |
+            linux-release-downloads-v1-
 
       - name: Install Python build dependencies
         shell: bash
@@ -102,31 +81,70 @@ jobs:
           uv venv --python "$(command -v python)" .venv
           uv pip install --python .venv/bin/python -r tools/requirements.txt
 
-      - name: Reuse or regenerate the runtime layout metadata
-        env:
-          INSTALL_DIR: ${{ inputs.install_dir }}
-          GAME_TAG: ${{ steps.cache.outputs.version }}
-          REUSE_GEN: ${{ steps.cache.outputs.reuse_gen }}
+      - name: Create game-independent runtime layout
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p generated
-          target="generated/$GAME_TAG"
-          if [ -e "$target" ] || [ -L "$target" ]; then
-            rm -rf "$target"
-          fi
+          python - <<'PY'
+          import json
+          from pathlib import Path
 
-          if [ "$REUSE_GEN" = "yes" ]; then
-            ln -s "$(realpath "$INSTALL_DIR/.setup-temp/gen")" "$target"
-            echo "Reusing generated metadata from the existing 0.4.0 installation."
-          else
-            .venv/bin/python recomp/gen.py \
-              --exefs "$INSTALL_DIR/exefs" \
-              --out "$target" \
-              --patches "recomp/patches-$GAME_TAG.txt"
-            echo "Regenerated code metadata from the already-extracted ExeFS; no NSP/XCI extraction."
-          fi
-          test -f "$target/layout.json"
+          expected_path = Path("tools/data/expected-v1.2.1.json")
+          expected = json.loads(expected_path.read_text(encoding="utf-8"))
+          hashes = expected["exefs_sha256"]
+
+          # The prebuilt runtime library does not contain lifted game code. Its only generated-layout
+          # dependencies are MOD_COUNT and MOD_MAIN_BASE, which the project documents as identical
+          # between 1.2.1 and 1.4.3. Use the public module order and the fixed guest base; dummy sizes
+          # are only for the temporary metadata read by --make-runtime-lib and are never compiled into
+          # the library or included in the AppImage.
+          order = ["main", *[f"subsdk{i}" for i in range(10)], "sdk"]
+          names = [name for name in order if name in hashes]
+          if names != ["main", "subsdk0", "sdk"]:
+              raise SystemExit(f"Unexpected 1.2.1 module set: {names!r}")
+
+          first_base = 0x7000000000
+          align = 0x200000
+          modules = []
+          base = first_base
+          for name in names:
+              size = 1
+              modules.append({
+                  "name": name,
+                  "base": f"{base:#x}",
+                  "size": f"{size:#x}",
+              })
+              base = (base + size + align - 1) & ~(align - 1)
+
+          out = Path("generated/v121")
+          out.mkdir(parents=True, exist_ok=True)
+          (out / "layout.json").write_text(
+              json.dumps(modules, indent=1) + "\n", encoding="utf-8"
+          )
+
+          lines = [
+              "// Temporary game-independent layout for building libtotkrt; not game code.",
+              "#pragma once",
+              "",
+          ]
+          for module in modules:
+              macro = module["name"].upper()
+              lines.append(f"#define MOD_{macro}_BASE {module['base']}ull")
+              lines.append(f"#define MOD_{macro}_SIZE {module['size']}ull")
+          lines.extend([
+              "",
+              f"#define MOD_COUNT {len(modules)}",
+              "#define MOD_LIST(X) " + " ".join(
+                  f"X({m['name']}, {m['name'].upper()})" for m in modules
+              ),
+              "",
+          ])
+          (out / "layout.h").write_text("\n".join(lines), encoding="utf-8")
+          print("Prepared temporary, game-independent runtime layout:")
+          print(f"  modules={names}")
+          print(f"  MOD_COUNT={len(names)}")
+          print(f"  MOD_MAIN_BASE={first_base:#x}")
+          PY
 
       - name: Build Linux setup AppImage
         shell: bash
@@ -136,7 +154,10 @@ jobs:
             --out build/release/TotK-Setup-linux \
             --appimage build/release/TotK-Setup-x86_64.AppImage
           test -s build/release/TotK-Setup-x86_64.AppImage
+          test ! -e build/release/TotK-Setup-linux/generated
           chmod +x build/release/TotK-Setup-x86_64.AppImage
+          file build/release/TotK-Setup-x86_64.AppImage
+          sha256sum build/release/TotK-Setup-x86_64.AppImage
 
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v4
@@ -144,4 +165,5 @@ jobs:
           name: TotK-Setup-x86_64-${{ github.sha }}
           path: build/release/TotK-Setup-x86_64.AppImage
           if-no-files-found: error
-          retention-days: 14
+          compression-level: 0
+          retention-days: 30
