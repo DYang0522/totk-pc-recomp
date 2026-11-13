@@ -150,10 +150,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # GitHub-hosted runners have no physical GPU; use Mesa lavapipe for the Vulkan self-test.
-          export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-          export VK_DRIVER_FILES="$VK_ICD_FILENAMES"
-          test -s "$VK_ICD_FILENAMES"
+          # GitHub-hosted runners have no physical GPU; locate Mesa lavapipe's ICD
+          # instead of assuming a distro-specific filename.
+          ICD_DIRS=(/usr/share/vulkan/icd.d /etc/vulkan/icd.d)
+          VK_ICD="$(find "${ICD_DIRS[@]}" -maxdepth 1 -type f \\( -iname '*lvp*.json' -o -iname '*lavapipe*.json' \\) -print -quit 2>/dev/null || true)"
+          if [[ -z "$VK_ICD" ]]; then
+            echo "::error::Mesa lavapipe ICD JSON was not found."
+            find /usr/share/vulkan /etc/vulkan -maxdepth 3 -type f -name '*.json' -print 2>/dev/null || true
+            exit 1
+          fi
+          echo "Using Vulkan ICD: $VK_ICD"
+          export VK_ICD_FILENAMES="$VK_ICD"
+          export VK_DRIVER_FILES="$VK_ICD"
           vulkaninfo --summary
           xvfb-run -a .venv/bin/python tools/make_release_linux.py \
             --out build/release/TotK-Setup-linux \
