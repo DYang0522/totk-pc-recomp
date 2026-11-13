@@ -25,6 +25,15 @@ jobs:
           ref: dev
           persist-credentials: false
 
+      - name: Set up Python and .NET
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
       - name: Validate existing installation cache
         id: cache
         env:
@@ -32,7 +41,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          python - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           import os
           from pathlib import Path
@@ -42,7 +51,9 @@ jobs:
               raise SystemExit("install_dir must be an absolute path")
           install = install.resolve()
           state_path = install / "totk-install.json"
-          gen = install / ".setup-temp" / "gen"
+          temp = install / ".setup-temp"
+          gen = temp / "gen"
+          build = temp / "build"
 
           if not install.is_dir():
               raise SystemExit(f"Install folder does not exist: {install}")
@@ -65,6 +76,8 @@ jobs:
           print(f"version={tags[version]}")
           print(f"install_dir={install}")
           print(f"gen_dir={gen.resolve()}")
+          print(f"build_cache={'yes' if build.is_dir() else 'no'}")
+          print(f"shader_cache={'yes' if (install / 'shader-cache').is_dir() else 'no'}")
           print(f"Using existing game version {version}; no game dump or prod.keys are uploaded.")
           PY
 
@@ -72,6 +85,8 @@ jobs:
         env:
           INSTALL_DIR: ${{ inputs.install_dir }}
           GAME_TAG: ${{ steps.cache.outputs.version }}
+          BUILD_CACHE: ${{ steps.cache.outputs.build_cache }}
+          SHADER_CACHE: ${{ steps.cache.outputs.shader_cache }}
         shell: bash
         run: |
           set -euo pipefail
@@ -83,22 +98,18 @@ jobs:
           ln -s "$(realpath "$INSTALL_DIR/.setup-temp/gen")" "$target"
           test -f "$target/layout.json"
           echo "Linked $target to the existing local install cache."
+          echo "Existing compile cache: $BUILD_CACHE; existing shader cache: $SHADER_CACHE."
 
-      - name: Install build prerequisites
+      - name: Check host build tools
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y make pkg-config
-
-      - name: Set up Python and .NET
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "10.0.x"
+          for tool in make pkg-config tar xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Missing '$tool'. Install the Linux release prerequisites from docs/installer.md."
+              exit 1
+            fi
+          done
 
       - name: Install Python build dependencies
         shell: bash
