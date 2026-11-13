@@ -57,7 +57,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            build-essential binutils pkg-config make tar xz-utils git curl zlib1g-dev
+            build-essential binutils pkg-config make tar xz-utils git curl zlib1g-dev xvfb
 
       - name: Fetch pinned reference projects
         shell: bash
@@ -150,7 +150,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          .venv/bin/python tools/make_release_linux.py \
+          xvfb-run -a .venv/bin/python tools/make_release_linux.py \
             --out build/release/TotK-Setup-linux \
             --appimage build/release/TotK-Setup-x86_64.AppImage
           test -s build/release/TotK-Setup-x86_64.AppImage
