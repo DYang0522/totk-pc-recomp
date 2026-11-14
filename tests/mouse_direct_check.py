@@ -334,7 +334,7 @@ int main(void) {
     // mouse's degrees, once per sample
     {
         assert(load_hook);
-        unsigned char input_pair[2][0x500]={0}, cam[0x200]={0};
+        _Alignas(8) unsigned char input_pair[2][0x500]={0}, cam[0x200]={0};
         unsigned char *input=input_pair[0], *input_alias=input_pair[1];
         float frame[0x20]={0};
         guest_read_begin=(uintptr_t)input_pair; guest_read_end=guest_read_begin+sizeof input_pair;
@@ -566,7 +566,7 @@ int main(void) {
     uint32_t w9; memcpy(&w9,(unsigned char *)frame+0x18,4); assert(w9==0x12345678);
     // Load sites
     {
-        unsigned char input_pair[2][0x500]={0}, cam[0x200]={0}; uint64_t lsp[0x10]={0}, fp[0x20]={0};
+        _Alignas(8) unsigned char input_pair[2][0x500]={0}, cam[0x200]={0}; uint64_t lsp[0x10]={0}, fp[0x20]={0};
         unsigned char *input=input_pair[0], *input_alias=input_pair[1];
         guest_read_begin=(uintptr_t)input_pair; guest_read_end=guest_read_begin+sizeof input_pair;
         float pad_x=0.25f, pad_y=-0.5f;
