@@ -18,6 +18,7 @@ const int rt_game_version = TEST_GAME_VERSION;
 static int raw_x, raw_y, takes, captured=1, foreground=1, allowed=1, mode=1, patched=1, selecting;
 static float ratio=0.5f;
 static uint64_t now=1000000000;
+static uint64_t guest_read_begin, guest_read_end;
 static GuestFn hook, activity_hook, begin_hook, angles_hook, hand_hook, load_hook, state_hook;
 const char *cfg_get(const char *key) { (void)key; return mode ? "direct" : "stick"; }
 const char *cfg_value(const char *key) { return cfg_get(key); }
@@ -48,7 +49,9 @@ void rt_log(const char *fmt, ...) { (void)fmt; }
 float cam_speed_applied(void) { return 1; }
 static uint64_t buttons;
 uint64_t input_buttons_last(void) { return buttons; }
-int mem_guest_readable(uint64_t a, uint64_t n) { (void)a; (void)n; return 0; }   // no player: on-foot gains
+int mem_guest_readable(uint64_t a, uint64_t n) {
+    return guest_read_begin && a >= guest_read_begin && a <= guest_read_end && n <= guest_read_end - a;
+}   // only explicitly registered test buffers are readable
 static float scalar(__uint128_t v) { float f; memcpy(&f,&v,4); return f; }
 #if TEST_GAME_VERSION == 143
 int main(void) {
@@ -331,7 +334,10 @@ int main(void) {
     // mouse's degrees, once per sample
     {
         assert(load_hook);
-        unsigned char input[0x500]={0}, cam[0x200]={0}; float frame[0x20]={0};
+        unsigned char input_pair[2][0x500]={0}, cam[0x200]={0};
+        unsigned char *input=input_pair[0], *input_alias=input_pair[1];
+        float frame[0x20]={0};
+        guest_read_begin=(uintptr_t)input_pair; guest_read_end=guest_read_begin+sizeof input_pair;
         float pad_x=0.25f, pad_y=-0.5f;
         #define LOAD(site,reg) (c.x[30]=MOD_MAIN_BASE+(site)+4, load_hook(&c), scalar(c.v[reg]))
         #define SAMPLE(dx,dy) do { c.x[20]=(uintptr_t)input; c.x[21]=0; c.v[9]=0; c.v[10]=0; \
@@ -372,19 +378,45 @@ int main(void) {
         // Inside the limits all of it is degrees
         SAMPLE(0,-50); guest_float_store((uintptr_t)cam+0x160,0);
         assert(LOAD(0x23c0a1c,11)==pad_y && fabsf(LOAD(0x23c0b00,0)+50*DEG_PER_COUNT)<1e-5f);
+        // SpecialPower can use a second input pointer (x23). Accept it only when both stored axes match this sample.
+        SAMPLE(100,-50); memcpy(input_alias,input,0x500); c.x[23]=(uintptr_t)input_alias;
+        guest_float_store((uintptr_t)cam+0x160,8); guest_float_store((uintptr_t)cam+0x1ac,-40);
+        guest_float_store((uintptr_t)cam+0x1b0,40);
+        assert(LOAD(0x23d2eec,8)==pad_x && LOAD(0x23d2ef4,14)==pad_y);
+        assert(fabsf(LOAD(0x23d3158,0)-(8-50*DEG_PER_COUNT))<1e-5f);
         // The ability camera's offset mode (input +0x15c bit 8) keeps the mouse in the stick and adds no degrees
         SAMPLE(100,0); uint32_t offset_mode=0x100; memcpy(input+0x15c,&offset_mode,4);
         assert(LOAD(0x23d2eec,8)==guest_float((uintptr_t)input+0x420));
         frame[0x18-0x14]=7; assert(LOAD(0x23d34cc,1)==7);   // [x29-0x50]
         offset_mode=0; memcpy(input+0x15c,&offset_mode,4);
-        // Horse: the input is x20 / x21; another camera's input or a stale sample is left alone
+        // A blocked SpecialPower camera can still receive mouse motion while the Ultrahand hook is live.
+        c.x[19]=(uintptr_t)hand; c.sp=(uintptr_t)frame; c.v[15]=0; hand_hook(&c);
+        c.x[19]=(uintptr_t)cam; c.x[20]=(uintptr_t)input; c.x[21]=1;
+        c.v[9]=c.v[10]=0; raw_x=100; raw_y=-50; hook(&c);
+        guest_float_store((uintptr_t)input+0x424,scalar(c.v[10]));
+        assert(!sample.camera_enabled && sample.angle[0] && sample.angle[1]);
+        c.x[23]=(uintptr_t)input; guest_float_store((uintptr_t)cam+0x160,8);
+        guest_float_store((uintptr_t)cam+0x1ac,-40); guest_float_store((uintptr_t)cam+0x1b0,40);
+        assert(LOAD(0x23d2eec,8)==0 && LOAD(0x23d2ef4,14)==0);
+        assert(fabsf(LOAD(0x23d3158,0)-(8-50*DEG_PER_COUNT))<1e-5f);
+        // Horse: yaw uses x20 and pitch uses x21. A second pointer is accepted only when both stored axes
+        // match this sample; an unrelated object's values are left alone.
         SAMPLE(100,-50); c.x[20]=(uintptr_t)input; c.x[21]=(uintptr_t)input;
         guest_float_store((uintptr_t)cam+0x68,5); guest_float_store((uintptr_t)cam+0x64,6);
         assert(LOAD(0x23cb274,8)==pad_x && fabsf(LOAD(0x23cb2a0,1)-(5-100*DEG_PER_COUNT))<1e-5f);
         assert(LOAD(0x23cb3f8,8)==pad_y && fabsf(LOAD(0x23cb424,1)-(6-50*DEG_PER_COUNT))<1e-5f);
+        SAMPLE(100,-50); memcpy(input_alias,input,0x500); c.x[20]=(uintptr_t)input; c.x[21]=(uintptr_t)input_alias;
+        guest_float_store((uintptr_t)cam+0x64,6);
+        assert(LOAD(0x23cb3f8,8)==pad_y);
+        assert(fabsf(LOAD(0x23cb424,1)-(6-50*DEG_PER_COUNT))<1e-5f);
+        SAMPLE(100,-50); memcpy(input_alias,input,0x500); guest_float_store((uintptr_t)input_alias+0x420,0.875f);
+        c.x[20]=(uintptr_t)input; c.x[21]=(uintptr_t)input_alias;
+        guest_float_store((uintptr_t)cam+0x64,6);
+        assert(LOAD(0x23cb3f8,8)==guest_float((uintptr_t)input_alias+0x424));
+        assert(LOAD(0x23cb424,1)==6);
         SAMPLE(100,-50); unsigned char other[0x500]; memcpy(other,input,sizeof other); c.x[20]=(uintptr_t)other;
         assert(LOAD(0x23cb274,8)==guest_float((uintptr_t)other+0x420) && LOAD(0x23cb2a0,1)==5);
-        c.x[20]=(uintptr_t)input; now+=150000000ull;
+        c.x[20]=(uintptr_t)input; c.x[21]=(uintptr_t)input; now+=150000000ull;
         assert(LOAD(0x23cb274,8)==guest_float((uintptr_t)input+0x420) && LOAD(0x23cb2a0,1)==5);
         // The ability camera's offset mode (Recall's cursor): before its scale was read the mouse stays in the stick;
         // then the offset moves so that the aim, o * P + atan(o * tan(half view angle)), moves by the mouse's degrees
@@ -491,6 +523,7 @@ int main(void) {
         mode=0; c.x[20]=(uintptr_t)input; assert(LOAD(0x23cb274,8)==guest_float((uintptr_t)input+0x420)); mode=1;
         #undef LOAD
         #undef SAMPLE
+        guest_read_begin=guest_read_end=0;
     }
     puts("direct mouse: aiming, scope, ability, Recall cursor, horse, Purah Pad, lock-on, bow lock-on, climbing, waterfall, dialogue and shield cameras in degrees passed");
     puts("direct mouse: one turn rate, linear pitch, ability gains and the hold after a handoff passed");
@@ -533,7 +566,9 @@ int main(void) {
     uint32_t w9; memcpy(&w9,(unsigned char *)frame+0x18,4); assert(w9==0x12345678);
     // Load sites
     {
-        unsigned char input[0x500]={0}, cam[0x200]={0}; uint64_t lsp[0x10]={0}, fp[0x20]={0};
+        unsigned char input_pair[2][0x500]={0}, cam[0x200]={0}; uint64_t lsp[0x10]={0}, fp[0x20]={0};
+        unsigned char *input=input_pair[0], *input_alias=input_pair[1];
+        guest_read_begin=(uintptr_t)input_pair; guest_read_end=guest_read_begin+sizeof input_pair;
         float pad_x=0.25f, pad_y=-0.5f;
         #define LOAD(site,reg) (c.x[30]=MOD_MAIN_BASE+(site)+4, load_hook(&c), scalar(c.v[reg]))
         #define SAMPLE(dx,dy) do { c.x[20]=(uintptr_t)input; c.x[21]=0; c.v[11]=0; c.v[10]=0; \
@@ -552,9 +587,31 @@ int main(void) {
         assert(LOAD(0x1d34584,1)==pad_x);
         guest_float_store((uintptr_t)(fp+0x10)-0x48,40);
         assert(fabsf(LOAD(0x1d345d0,1)-(40-100*DEG_PER_COUNT))<1e-5f);
-        // Horse yaw: the turn ([sp+0x18]) the helper adds to +0x68 gets the degrees
+        // Horse yaw uses x20; pitch uses x21 and accepts only a second input object with matching axis data.
         SAMPLE(100,-50); c.x[20]=(uintptr_t)input; guest_float_store((uintptr_t)lsp+0x18,0.5f);
         assert(LOAD(0x1d4070c,8)==pad_x && fabsf(LOAD(0x1d40740,0)-(0.5f-100*DEG_PER_COUNT))<1e-5f);
+        SAMPLE(100,-50); memcpy(input_alias,input,0x500); c.x[20]=(uintptr_t)input; c.x[21]=(uintptr_t)input_alias;
+        guest_float_store((uintptr_t)cam+0x64,6);
+        assert(LOAD(0x1d408f8,8)==pad_y);
+        assert(fabsf(LOAD(0x1d409ac,1)-(6-50*DEG_PER_COUNT))<1e-5f);
+        // SpecialPower's x22 input can also be an alias; compare both axes before accepting it.
+        SAMPLE(100,-50); memcpy(input_alias,input,0x500); c.x[22]=(uintptr_t)input_alias;
+        uint32_t no_offset=0; memcpy(input+0x15c,&no_offset,4);
+        guest_float_store((uintptr_t)cam+0x160,8); guest_float_store((uintptr_t)cam+0x1ac,-40);
+        guest_float_store((uintptr_t)cam+0x1b0,40);
+        assert(LOAD(0x1d48478,15)==pad_x && LOAD(0x1d48480,12)==pad_y);
+        assert(fabsf(LOAD(0x1d48bb4,2)-(8-50*DEG_PER_COUNT))<1e-5f);
+        // Blocked SpecialPower can still use Direct Mouse while the Ultrahand hook is active, even though 1.2.1
+        // cannot identify the player's ability verb from its player-state layout.
+        c.x[19]=(uintptr_t)hand; c.sp=(uintptr_t)frame; c.v[15]=0; hand_hook(&c);
+        c.x[19]=(uintptr_t)cam; c.x[20]=(uintptr_t)input; c.x[21]=1;
+        c.v[11]=c.v[10]=0; raw_x=100; raw_y=-50; hook(&c);
+        guest_float_store((uintptr_t)input+0x424,scalar(c.v[10]));
+        assert(!sample.camera_enabled && sample.angle[0] && sample.angle[1]);
+        c.x[22]=(uintptr_t)input; guest_float_store((uintptr_t)cam+0x160,8);
+        guest_float_store((uintptr_t)cam+0x1ac,-40); guest_float_store((uintptr_t)cam+0x1b0,40);
+        assert(LOAD(0x1d48478,15)==0 && LOAD(0x1d48480,12)==0);
+        assert(fabsf(LOAD(0x1d48bb4,2)-(8-50*DEG_PER_COUNT))<1e-5f);
         // Wakeboard reads each axis twice: the first reads give the same values and leave the degrees to the second
         SAMPLE(100,-50); c.x[22]=(uintptr_t)input;
         float total=guest_float((uintptr_t)input+0x424);
@@ -576,6 +633,7 @@ int main(void) {
         assert(c.x[23]==(uintptr_t)cam+0x5c);
         #undef LOAD
         #undef SAMPLE
+        guest_read_begin=guest_read_end=0;
     }
     puts("direct mouse 1.2.1: camera input in s11, activity, orbit angles at sp+0x3c/0x40, Ultrahand in s9 passed");
     puts("direct mouse 1.2.1: aiming pitch store, horse turn, repeated stick reads, w8 yaw and dialogue loads passed");
