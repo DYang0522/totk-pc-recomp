@@ -141,7 +141,8 @@ static const MouseLayout *mouse_layout(void);
 
 typedef struct {
     uint64_t object, generation, when;
-    float pad[2], motion[2], angle[2];   // post-inversion controller input, mouse input, mouse yaw/pitch in degrees
+    float pad[2], motion[2], angle[2];   // post-inversion controller input, hand motion, mouse yaw/pitch in degrees
+    float input[2];                     // exact x/y values written to the game's input object, before its later loads
     int camera_enabled;
     int swing;         // a mouse shake swings the right stick in this step or did in the last (pad[0] is 0 then)
     uint32_t player;   // player_state_logged's flags for this step (0 without mouse motion)
@@ -366,6 +367,9 @@ static void camera_input(Cpu *c) {
     __atomic_store_n(&accepts_mouse, accept, __ATOMIC_RELAXED);
     __atomic_store_n(&last_update, plat_now_ns(), __ATOMIC_RELEASE);
     MouseSample next = {.object = c->x[20], .when = plat_now_ns(), .camera_enabled = accept};
+    float input[2];
+    memcpy(&input[0], &c->v[rx], sizeof(float));
+    memcpy(&input[1], &c->v[10], sizeof(float));
     memcpy(&next.pad[0], &c->v[rx], sizeof(float));
     memcpy(&next.pad[1], &c->v[10], sizeof(float));
     if (flags & 2) next.pad[0] = -next.pad[0];
@@ -407,9 +411,6 @@ static void camera_input(Cpu *c) {
         }
         if (isfinite(ratio) && ratio > 0 && sensitivity > 0 && (dx || dy)) {
             if (accept) mouse_input_object = c->x[20];
-            float x, y;
-            memcpy(&x, &c->v[rx], sizeof x);
-            memcpy(&y, &c->v[10], sizeof y);
             float hand = HAND_PER_COUNT * sensitivity / ratio;
             next.motion[0] = fminf(HAND_MAX, fmaxf(-HAND_MAX, dx * hand * (flags & 2 ? -1 : 1)));
             next.motion[1] = fminf(HAND_MAX, fmaxf(-HAND_MAX, -dy * hand * (flags & 4 ? -1 : 1)));
@@ -417,10 +418,10 @@ static void camera_input(Cpu *c) {
             next.angle[1] = dy * DEG_PER_COUNT * sensitivity * (flags & 4 ? -1 : 1);
             // stick_sens multiplies the game's stick turn rates (camera_speed.c): the mouse divides it out
             if (accept) mouse_stick_add(dx, dy, STICK_PER_COUNT * sensitivity / (ratio * cam_speed_applied()), ability,
-                                        &x, &y);
+                                        &input[0], &input[1]);
             uint32_t xb, yb;
-            memcpy(&xb, &x, sizeof xb);
-            memcpy(&yb, &y, sizeof yb);
+            memcpy(&xb, &input[0], sizeof xb);
+            memcpy(&yb, &input[1], sizeof yb);
             c->v[rx] = xb;
             c->v[10] = yb;
             static int logged;
@@ -430,6 +431,8 @@ static void camera_input(Cpu *c) {
             }
         }
     }
+    next.input[0] = input[0];
+    next.input[1] = input[1];
     plat_mutex_lock(&sample_lock);
     MouseSample last = sample;
     int untaken = last.camera_enabled && (last.angle[0] || last.angle[1]) && sample_taken != last.generation;
@@ -935,13 +938,40 @@ static float recall_offset(float o, float range, float t, float degrees) {
     return isfinite(n) ? n - o : 0;
 }
 
+// Some camera routines keep equivalent stick data behind a second input pointer (Horse pitch: x21; SpecialPower:
+// x22 on 1.2.1 and x23 on 1.4.3). Do not trust the register number alone: accept that alias only for these exact
+// camera loads and only when both stored axes match the values from the camera-input update.
+static int load_input_matches(const LoadSite *s, const MouseSample *m, uint64_t input) {
+    if (m->object == input) return 1;
+    int alias = (s->mode == MODE_HORSE && s->axis == 1 && s->input_reg == 21) ||
+                (s->mode == MODE_ABILITY && (s->input_reg == 22 || s->input_reg == 23));
+    if (!alias || !readable(input, 0x428)) return 0;
+    uint32_t actual[2], expected[2];
+    memcpy(&actual[0], (const void *)(uintptr_t)(input + 0x420), sizeof actual[0]);
+    memcpy(&actual[1], (const void *)(uintptr_t)(input + 0x424), sizeof actual[1]);
+    memcpy(&expected[0], &m->input[0], sizeof expected[0]);
+    memcpy(&expected[1], &m->input[1], sizeof expected[1]);
+    return actual[0] == expected[0] && actual[1] == expected[1];
+}
+
+// A blocked camera update normally rejects Direct Mouse. SpecialPower is the exception while the Ultrahand
+// manipulation hook is live: camera_input has consumed the raw mouse on that path, so returning the mouse to the
+// game's stick fallback would lose it and leave Autobuild without camera input.
+static int load_input_enabled(const LoadSite *s, const MouseSample *m, uint64_t now) {
+    if (m->camera_enabled) return 1;
+    return s->mode == MODE_ABILITY && hand_active(now) &&
+           (m->angle[0] || m->angle[1] || m->swing);
+}
+
 // The stick load: the gamepad's part of the axis, and the degrees for the base load. f is what the game stored.
 static float load_stick(const LoadSite *s, Cpu *c, float f) {
     uint64_t object = c->x[19], input = c->x[s->input_reg];
     int pair = PAIR(s->mode, s->axis);
     if (!(s->flags & REPEAT)) load_pending[pair].object = 0;
     MouseSample m = sample_read();
-    if (m.object != input || !m.camera_enabled || plat_now_ns() - m.when >= 150000000ull) return f;
+    uint64_t now = plat_now_ns();
+    if (!load_input_matches(s, &m, input) || !load_input_enabled(s, &m, now) ||
+        now - m.when >= 150000000ull) return f;
     // A step without the mouse in it keeps the game's value as it is: the gamepad's stick and anything else the game
     // put there after the input update (the sample's pad is only the stick the update stored)
     if (!m.angle[0] && !m.angle[1] && !m.swing) return f;
