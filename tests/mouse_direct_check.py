@@ -57,7 +57,7 @@ static float scalar(__uint128_t v) { float f; memcpy(&f,&v,4); return f; }
 int main(void) {
     assert(hook && activity_hook);
     Cpu c, expected;
-    unsigned char target[0x500] = {0};
+    unsigned char target[0x500] = {0}, hand[0x300] = {0};
     memset(&c, 0x5a, sizeof c);
     c.x[20]=(uintptr_t)target; c.x[21]=0; c.v[9]=c.v[10]=0;
     expected=c;
